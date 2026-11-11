@@ -1,0 +1,16 @@
+# Synopsis document (kept out of the repo)
+992401030010_LakshyaSaxena_OS_Synopsis_Container_Runtime.docx
+~$*.docx
+
+# Build output
+build/
+crun
+*.o
+*.d
+
+# Container root filesystem
+rootfs/
+*.tar.gz
+
+# Editor
+.vscode/
