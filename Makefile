@@ -5,10 +5,11 @@ ROOTFS   ?= rootfs
 ALPINE_URL ?= https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
 
 LIB_SRC := src/cli.cpp src/sandbox.cpp src/fs.cpp src/cgroup.cpp src/monitor.cpp \
-           src/pressure.cpp src/elastic.cpp src/softland.cpp src/recorder.cpp
+           src/pressure.cpp src/elastic.cpp src/softland.cpp src/recorder.cpp src/image.cpp \
+           src/state.cpp
 LIB_OBJ := $(LIB_SRC:src/%.cpp=build/%.o)
 
-.PHONY: all test itest eval workloads rootfs clean
+.PHONY: all test itest eval workloads rootfs pydemo clean
 
 all: crun
 
@@ -55,6 +56,16 @@ itest: crun build/integration workloads
 
 eval: crun build/eval workloads
 	./build/eval ./crun $(ROOTFS) build/results
+
+# Real-image demo: Docker only fetches the image, crun runs it. Needs root and Docker.
+PYIMAGE ?= python:3.12-slim
+PYROOT  := /var/lib/crun/images/$(subst @,_,$(subst :,_,$(subst /,_,$(PYIMAGE))))
+
+pydemo: crun
+	test -d $(PYROOT) || ./crun pull $(PYIMAGE)
+	mkdir -p build/results
+	./crun run --memory 256M --record build/results/python-static --rootfs $(PYROOT) -- python3 - < tests/py/footprint.py
+	./crun run --elastic --memory 256M --record build/results/python-elastic --rootfs $(PYROOT) -- python3 - < tests/py/footprint.py
 
 clean:
 	rm -rf build crun

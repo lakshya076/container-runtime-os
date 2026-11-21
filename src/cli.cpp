@@ -6,11 +6,17 @@
 #include <stdexcept>
 
 const char* const kUsage =
+    "usage: crun pull IMAGE [DIR]\n"
+    "  fetch IMAGE with Docker and unpack its filesystem into DIR\n"
+    "  (default: /var/lib/crun/images/<image>), for use with run --rootfs\n"
+    "usage: crun ps\n"
+    "  list running containers with live memory, limits and engine actions\n"
     "usage: crun run [options] --rootfs DIR [--] CMD [ARGS...]\n"
     "  --memory SIZE    hard memory limit (memory.max), e.g. 64M, 1G, max (default: max)\n"
     "  --swap SIZE      swap limit (memory.swap.max) (default: 0)\n"
     "  --pids N         max number of processes (pids.max) (default: max)\n"
     "  --hostname NAME  container hostname (default: container)\n"
+    "  --name NAME      name shown by `crun ps` (default: container_<pid>)\n"
     "  --stats MS       print live memory usage every MS milliseconds (default: off)\n"
     "  --rootfs DIR     root filesystem for the container (required)\n"
     "elastic memory engine (all need a finite --memory):\n"
@@ -28,6 +34,28 @@ const char* soft_oom_name(SoftOom p) {
         case SoftOom::notify: return "notify";
         default: return "off";
     }
+}
+
+bool valid_image_ref(const std::string& ref) {
+    if (ref.empty() || ref.size() > 255 || !std::isalnum(static_cast<unsigned char>(ref[0]))) return false;
+    return std::all_of(ref.begin(), ref.end(), [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '/' || c == ':' ||
+               c == '@' || c == '-';
+    });
+}
+
+std::string default_image_dir(const std::string& ref) {
+    std::string name = ref;
+    std::replace_if(name.begin(), name.end(), [](char c) { return c == '/' || c == ':' || c == '@'; }, '_');
+    return std::string(kImagesRoot) + "/" + name;
+}
+
+PullOptions parse_pull_args(const std::vector<std::string>& args) {
+    if (args.empty() || args.size() > 2) throw std::invalid_argument("pull needs IMAGE and an optional DIR");
+    if (!valid_image_ref(args[0])) throw std::invalid_argument("invalid image reference: '" + args[0] + "'");
+    PullOptions p{args[0], args.size() == 2 ? args[1] : default_image_dir(args[0])};
+    if (p.dest.empty()) throw std::invalid_argument("DIR must not be empty");
+    return p;
 }
 
 long long parse_size(const std::string& s) {
@@ -76,6 +104,14 @@ Options parse_run_args(const std::vector<std::string>& args) {
         else if (a == "--swap") o.swap = parse_size(value(a));
         else if (a == "--pids") { const std::string& v = value(a); o.pids = v == "max" ? -1 : parse_int(a, v); }
         else if (a == "--hostname") o.hostname = value(a);
+        else if (a == "--name") {
+            o.name = value(a);
+            bool ok = !o.name.empty() && o.name.size() <= 64 &&
+                      std::all_of(o.name.begin(), o.name.end(), [](unsigned char c) {
+                          return std::isalnum(c) || c == '-' || c == '_' || c == '.';
+                      });
+            if (!ok) throw std::invalid_argument("--name must be 1-64 characters of [A-Za-z0-9._-]");
+        }
         else if (a == "--stats") o.stats_ms = parse_int(a, value(a));
         else if (a == "--rootfs") o.rootfs = value(a);
         else if (a == "--elastic") o.elastic = true;

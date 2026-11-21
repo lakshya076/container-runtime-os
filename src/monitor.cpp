@@ -3,10 +3,12 @@
 #include "pressure.hpp"
 #include "recorder.hpp"
 #include "softland.hpp"
+#include "state.hpp"
 #include "util.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -21,6 +23,7 @@ using Clock = std::chrono::steady_clock;
 constexpr auto kGrace = std::chrono::seconds(2);  // SIGTERM -> SIGKILL escalation delay
 constexpr int kTickMs = 100;                      // sampling / recording period
 constexpr int kControlTicks = 2;                  // elastic controller runs every 200 ms
+constexpr int kStateTicks = 5;                    // `crun ps` state refreshed every 500 ms
 
 double mib(double bytes) { return bytes / (1 << 20); }
 
@@ -64,6 +67,23 @@ int supervise(pid_t pid, const Cgroup& cg, const Options& opt, const sigset_t& s
     if (opt.elastic) ctl.emplace(opt.memory_min, land ? land->tripwire() : opt.memory);
     Recorder rec(opt.record);
 
+    std::string cmd;
+    for (const auto& a : opt.argv) cmd += (cmd.empty() ? "" : " ") + a;
+
+    // State for `crun ps`, refreshed every kStateTicks; the guard removes it on every exit path.
+    std::string mode = opt.elastic ? "elastic" : "static";
+    if (land) mode = (opt.elastic ? "elastic+soft:" : "soft:") + std::string(soft_oom_name(opt.soft_oom));
+    StateMap state{{"name", opt.name.empty() ? "container_" + std::to_string(pid) : opt.name},
+                   {"rootfs", opt.rootfs},
+                   {"command", cmd},
+                   {"mode", mode},
+                   {"started", std::to_string(static_cast<long long>(std::time(nullptr)))}};
+    struct StateGuard {
+        pid_t pid;
+        ~StateGuard() { remove_state(pid); }
+    } state_guard{pid};
+    bool pressured_since_publish = false;
+
     long long ooms = std::max(0LL, oom_kills(efd)), kernel_ooms = 0;
     constexpr auto kNever = Clock::time_point::max();
     Clock::time_point kill_at = kNever;  // when to escalate SIGTERM to SIGKILL
@@ -86,6 +106,18 @@ int supervise(pid_t pid, const Cgroup& cg, const Options& opt, const sigset_t& s
             note("oom_kill");
         }
     };
+
+    auto publish = [&] {
+        state["grows"] = std::to_string(ctl ? ctl->grows() : 0);
+        state["shrinks"] = std::to_string(ctl ? ctl->shrinks() : 0);
+        state["freezes"] = std::to_string(land ? land->freezes() : 0);
+        state["grants"] = std::to_string(land ? land->grants() : 0);
+        state["kernel_ooms"] = std::to_string(kernel_ooms);
+        state["pressured"] = pressured_since_publish ? "1" : "0";
+        pressured_since_publish = false;
+        write_state(pid, state);
+    };
+    publish();
 
     auto handle = [&](SoftLanding::Outcome o, long long current) {
         switch (o) {
@@ -137,6 +169,7 @@ int supervise(pid_t pid, const Cgroup& cg, const Options& opt, const sigset_t& s
                     std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
                 Sample s = probe.sample(t_ms);
                 pressured_since_step = pressured_since_step || s.pressured;
+                pressured_since_publish = pressured_since_publish || s.pressured;
                 if (ctl && tick % kControlTicks == 0) {
                     long long before = ctl->high();
                     long long now_high = ctl->step(pressured_since_step, s.c.current);
@@ -149,6 +182,7 @@ int supervise(pid_t pid, const Cgroup& cg, const Options& opt, const sigset_t& s
                 if (land) handle(land->check(Clock::now()), s.c.current);
                 rec.add(s, pending);
                 pending.clear();
+                if (tick % kStateTicks == 0) publish();
                 if (opt.stats_ms > 0 && t_ms >= next_stats_ms) {
                     next_stats_ms = t_ms + opt.stats_ms;
                     std::fprintf(stderr, "[crun] mem %.1f MiB / %.1f MiB (%.0f%%)", mib(static_cast<double>(s.c.current)),
@@ -191,8 +225,6 @@ int supervise(pid_t pid, const Cgroup& cg, const Options& opt, const sigset_t& s
     std::fprintf(stderr, "[crun] exit code %d, runtime %.2f s\n", code, runtime);
 
     std::vector<std::pair<std::string, std::string>> info;
-    std::string cmd;
-    for (const auto& a : opt.argv) cmd += (cmd.empty() ? "" : " ") + a;
     info.push_back({"command", cmd});
     info.push_back({"exit code", std::to_string(code)});
     char rt[32];
@@ -211,7 +243,9 @@ int supervise(pid_t pid, const Cgroup& cg, const Options& opt, const sigset_t& s
     } else {
         std::fprintf(stderr, "[crun] memory: no samples (exited in under %d ms)\n", kTickMs);
     }
-    if (ctl) {
+    if (ctl && sm.samples == 0) {
+        std::fprintf(stderr, "[crun] elastic: no samples, no recommendation\n");
+    } else if (ctl) {
         long long rec_limit = recommend_limit(sm.ws_p95, sm.ws_peak);
         std::fprintf(stderr, "[crun] elastic: %d grow / %d shrink, working set ~%.1f MiB, recommended --memory %lldM\n",
                      ctl->grows(), ctl->shrinks(), mib(static_cast<double>(sm.ws_p95)), rec_limit >> 20);

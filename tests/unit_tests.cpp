@@ -6,6 +6,7 @@
 #include "pressure.hpp"
 #include "recorder.hpp"
 #include "softland.hpp"
+#include "state.hpp"
 
 #include <cstdio>
 #include <stdexcept>
@@ -88,6 +89,64 @@ int main() {
     CHECK(throws([] { parse_run_args({"--memory", "64M", "--memory-min", "8M", "--rootfs", "/r", "x"}); }));  // no --elastic
     CHECK(throws([] { parse_run_args({"--memory", "64M", "--reserve", "8M", "--rootfs", "/r", "x"}); }));     // no --soft-oom
     CHECK(throws([] { parse_run_args({"--memory", "64M", "--elastic", "--memory-min", "64M", "--rootfs", "/r", "x"}); }));
+
+    // image pull arguments
+    CHECK(valid_image_ref("python:3.12-slim"));
+    CHECK(valid_image_ref("ghcr.io/org/app:1.0"));
+    CHECK(valid_image_ref("python@sha256:0123abcd"));
+    CHECK(!valid_image_ref(""));
+    CHECK(!valid_image_ref("-rm"));             // would be read as a docker option
+    CHECK(!valid_image_ref("../etc"));
+    CHECK(!valid_image_ref("python;rm -rf /"));
+    CHECK(!valid_image_ref("py thon"));
+    CHECK(!valid_image_ref(std::string(256, 'a')));
+    CHECK(default_image_dir("python:3.12-slim") == "/var/lib/crun/images/python_3.12-slim");
+    CHECK(default_image_dir("ghcr.io/org/app@sha256:ab") == "/var/lib/crun/images/ghcr.io_org_app_sha256_ab");
+    PullOptions po = parse_pull_args({"python:3.12-slim"});
+    CHECK(po.image == "python:3.12-slim" && po.dest == "/var/lib/crun/images/python_3.12-slim");
+    po = parse_pull_args({"alpine", "/srv/alpine"});
+    CHECK(po.dest == "/srv/alpine");
+    CHECK(throws([] { parse_pull_args({}); }));
+    CHECK(throws([] { parse_pull_args({"a", "b", "c"}); }));
+    CHECK(throws([] { parse_pull_args({"--help"}); }));
+    CHECK(throws([] { parse_pull_args({"alpine", ""}); }));
+
+    // --name
+    CHECK(parse_run_args({"--name", "py-static", "--rootfs", "/r", "x"}).name == "py-static");
+    CHECK(parse_run_args({"--rootfs", "/r", "x"}).name.empty());
+    CHECK(throws([] { parse_run_args({"--name", "bad name", "--rootfs", "/r", "x"}); }));
+    CHECK(throws([] { parse_run_args({"--name", "a/b", "--rootfs", "/r", "x"}); }));
+    CHECK(throws([] { parse_run_args({"--name", std::string(65, 'a'), "--rootfs", "/r", "x"}); }));
+
+    // ps state file and table
+    {
+        StateMap kv{{"name", "py"}, {"command", "python3 -\nrm"}, {"grows", "3"}};
+        std::string text = format_state(kv);
+        CHECK(text == "command=python3 - rm\ngrows=3\nname=py\n");  // newline in a value cannot add a key
+        StateMap back = parse_state(text + "junk line\n");
+        CHECK(back.size() == 3 && back["command"] == "python3 - rm" && back["grows"] == "3");
+        CHECK(parse_state("a=b=c\n")["a"] == "b=c");
+
+        PsRow r;
+        r.id = "4242";
+        r.name = "a-very-long-container-name";
+        r.image = "python_3.12-slim";
+        r.status = "running";
+        r.mode = "elastic";
+        r.actions = "+2 -9";
+        r.command = "python3 -";
+        r.mem = 50LL << 20;
+        r.high = 75LL << 20;
+        r.max = 256LL << 20;
+        r.uptime_s = 125;
+        std::string table = format_ps({r});
+        CHECK(table.rfind("ID ", 0) == 0);
+        CHECK(table.find("a-very-long~") != std::string::npos);  // clipped to the column
+        CHECK(table.find("50.0M") != std::string::npos && table.find("75.0M") != std::string::npos);
+        CHECK(table.find("256.0M") != std::string::npos && table.find("2m05s") != std::string::npos);
+        r.high = -1;
+        CHECK(format_ps({r}).find(" max ") != std::string::npos);
+    }
 
     // pressure probe helpers
     CHECK(parse_psi_total("some avg10=0.00 avg60=0.00 avg300=0.00 total=12345\nfull avg10=0 avg60=0 avg300=0 total=7\n") == 12345);

@@ -69,6 +69,96 @@ already do. On WSL2 you need a one-time fix first (see [WSL2 setup](#wsl2-setup-
    ```
    The comparison writes `build/results/index.html` with one chart page per scenario.
 
+### Running a real Docker image
+
+`crun pull` fetches an image with Docker and unpacks its filesystem into a plain directory.
+Docker does **only** the download:
+
+1. `docker pull`
+2. `docker create` (the container is never started)
+3. `docker export` piped into `tar`
+4. `docker rm`
+
+Running the image is done entirely by crun, with the same isolation, limits and memory engine as
+any other `--rootfs`. No Docker daemon is involved at run time. On WSL2, start Docker Desktop and
+turn on *Settings → Resources → WSL integration* for your distro first.
+
+```sh
+sudo ./crun pull python:3.12-slim            # -> /var/lib/crun/images/python_3.12-slim
+sudo ./crun run --memory 256M --stats 1000 --rootfs /var/lib/crun/images/python_3.12-slim \
+     -- python3 - < tests/py/footprint.py     # script is fed on stdin, nothing is copied in
+sudo make pydemo                              # pulls if needed, runs footprint.py static vs elastic
+```
+
+`tests/py/footprint.py` is a realistic data-job workload. It prints its own RSS after each phase:
+
+1. load records
+2. process a 100 MiB file (page cache)
+3. build a temporary index (spike)
+4. drop most of it
+
+`make pydemo` records both runs to `build/results/python-static.html` and
+`build/results/python-elastic.html`.
+
+**Limits of this feature:**
+
+- The image's `ENV`, `CMD` and `WORKDIR` are not applied; pass the command yourself. crun's
+  default `PATH` already covers the usual locations such as `/usr/local/bin`.
+- `/etc/resolv.conf` is left as the image ships it, so tools that need DNS (e.g. `pip install`)
+  may not resolve names.
+- To update an image, delete its directory and pull again.
+
+### Live benchmark: python and gcc, static vs elastic
+
+```sh
+sudo bash scripts/bench.sh
+```
+
+The script runs these steps:
+
+1. Pulls `python:3.12-slim` and `gcc:14` with `crun pull`, if they aren't already there. The gcc
+   image is about 1.4 GB.
+2. Starts four containers at once:
+   - `py-static` and `py-elastic` run `tests/py/footprint.py`, with a 256M limit.
+   - `gcc-static` and `gcc-elastic` compile `tests/bench/allocbench.cpp` with `g++` inside the
+     container and run it, with a 512M limit. Compiling inside the container means the compiler's
+     own memory use is measured too. The program fills a 1M-entry hash map, streams a 200 MiB file,
+     sorts 16M numbers, then frees it all.
+3. Redraws a live dashboard every second: `crun ps` plus each benchmark's latest phase and RSS.
+4. Prints a comparison table at the end. Logs and charts go to `build/bench/`.
+
+Measured on WSL2, kernel 5.15, all four containers running at once:
+
+| Container | Exit | Time s | Avg MiB | Peak MiB | Avg limit MiB | Recommended |
+|---|---|---|---|---|---|---|
+| py-static | 0 | 8.46 | 112.5 | 212.9 | 256.0 | – |
+| py-elastic | 0 | 8.68 | 84.3 | 142.6 | 114.0 | 132M |
+| gcc-static | 0 | 11.21 | 292.0 | 491.0 | 512.0 | – |
+| gcc-elastic | 0 | 11.99 | 229.4 | 373.6 | 288.4 | 344M |
+
+- **python, elastic vs static:** average memory −25 %, peak −33 %, runtime +3 %.
+- **gcc, elastic vs static:** average memory −21 %, peak −24 %, runtime +7 %.
+
+Each program's own RSS was the same in both modes. The saving is page cache that a static limit
+leaves charged to the container.
+
+### `crun ps`
+
+`crun ps` lists the running containers and needs no root. Unlike `docker ps`, it shows each
+container's live memory, its current soft limit (`HIGH`), whether it is under pressure or frozen,
+and what the elastic engine has done so far (`+grows -shrinks`, freezes, OOM kills).
+
+```
+ID      NAME         IMAGE              STATUS    MODE                MEM     HIGH      MAX ACTIONS     UP      COMMAND
+665     gcc-static   gcc_14             running   static           491.0M      max   512.0M -           7s      sh -c g++ -O2 -x c++ -o /tmp/allocbench~
+669     py-elastic   python_3.12-slim   running   elastic           25.3M   155.1M   256.0M +5 -14      7s      python3 -
+670     gcc-elastic  gcc_14             running   elastic          341.5M   397.2M   512.0M +9 -7       7s      sh -c g++ -O2 -x c++ -o /tmp/allocbench~
+```
+
+Each supervisor keeps a small state file at `/run/crun/<pid>`. It is refreshed every 500 ms and
+removed when the container exits. `ps` combines that file with the live cgroup files. Give
+containers readable names with `crun run --name NAME`.
+
 ## What's new compared to Docker
 
 Docker, runc and Podman set a **static** `memory.max` and let the kernel OOM killer end the
@@ -213,11 +303,17 @@ sudo ./crun run --elastic --memory 128M --record /tmp/run --rootfs /var/lib/crun
 ```
 
 ```
+usage: crun pull IMAGE [DIR]
+  fetch IMAGE with Docker and unpack its filesystem into DIR
+  (default: /var/lib/crun/images/<image>), for use with run --rootfs
+usage: crun ps
+  list running containers with live memory, limits and engine actions
 usage: crun run [options] --rootfs DIR [--] CMD [ARGS...]
   --memory SIZE    hard memory limit (memory.max), e.g. 64M, 1G, max (default: max)
   --swap SIZE      swap limit (memory.swap.max) (default: 0)
   --pids N         max number of processes (pids.max) (default: max)
   --hostname NAME  container hostname (default: container)
+  --name NAME      name shown by `crun ps` (default: container_<pid>)
   --stats MS       print live memory usage every MS milliseconds (default: off)
   --rootfs DIR     root filesystem for the container (required)
 elastic memory engine (all need a finite --memory):
@@ -261,6 +357,8 @@ runtime error, `2` for bad arguments.
 | Elastic controller | `src/elastic.*` | Grow/shrink `memory.high`, limit recommendation (pure logic) |
 | Soft landing | `src/softland.*` | Tripwire, freeze, diagnostics, kill/grant/notify policies |
 | Flight recorder | `src/recorder.*` | CSV stream, summary statistics, HTML/SVG report |
+| Image import | `src/image.*` | `crun pull`: `docker pull` / `create` / `export` piped into `tar` |
+| Runtime state | `src/state.*` | `/run/crun/<pid>` state files and the `crun ps` table |
 
 Shared helpers live in `src/util.hpp`. Tests are in `tests/`:
 
@@ -268,7 +366,7 @@ Shared helpers live in `src/util.hpp`. Tests are in `tests/`:
 - `integration.cpp` (T1–T13)
 - `eval.cpp` (evaluation harness)
 - `proc.hpp` (shared process helpers)
-- workloads: `memhog.cpp` and `phasehog.cpp`
+- workloads: `memhog.cpp`, `phasehog.cpp`, and `py/footprint.py` (for real Python images)
 
 ## Tests
 

@@ -2,22 +2,49 @@
 
 #include "cgroup.hpp"
 #include "cli.hpp"
+#include "image.hpp"
 #include "monitor.hpp"
 #include "sandbox.hpp"
 #include "softland.hpp"
+#include "state.hpp"
 
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <sys/wait.h>
+#include <vector>
 #include <unistd.h>
 
 static std::string limit(long long v) { return v < 0 ? "max" : std::to_string(v); }
 
+static int cmd_pull(const std::vector<std::string>& args) {
+    PullOptions opt;
+    try {
+        opt = parse_pull_args(args);
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "crun: " << e.what() << "\n" << kUsage;
+        return 2;
+    }
+    try {
+        // Root keeps the image's file owners intact and can write under /var/lib/crun.
+        if (geteuid() != 0) throw std::runtime_error("must run as root");
+        pull_image(opt);
+    } catch (const std::exception& e) {
+        std::cerr << "crun: " << e.what() << "\n";
+        return 125;
+    }
+    std::fprintf(stderr, "[crun] pulled %s into %s\n[crun] run it with: crun run --rootfs %s -- CMD\n",
+                 opt.image.c_str(), opt.dest.c_str(), opt.dest.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
+    if (argc >= 2 && std::string(argv[1]) == "pull") return cmd_pull(std::vector<std::string>(argv + 2, argv + argc));
+    if (argc == 2 && std::string(argv[1]) == "ps") return cmd_ps();
     if (argc < 2 || std::string(argv[1]) != "run") {
         std::cerr << kUsage;
         return 2;
